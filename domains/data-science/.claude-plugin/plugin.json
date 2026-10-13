@@ -1,0 +1,10 @@
+{
+  "name": "data-science",
+  "version": "1.0.0",
+  "description": "Data Science domain: exploratory data analysis, cleaning, wrangling, transformation, scientific visualization, SQL, classical ML, notebooks, pipelines and analytical reporting.",
+  "author": {
+    "name": "Samuel Oliveira"
+  },
+  "license": "MIT",
+  "keywords": ["data-science", "eda", "pandas", "polars", "sql", "machine-learning", "notebooks", "pipelines"]
+}

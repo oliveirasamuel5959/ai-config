@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ai-config — artifacts produced by sync.sh into a project tree
+.claude/backup-*/
+.opencode/backup-*/
+.claude/.ai-config-manifest

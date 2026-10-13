@@ -1,0 +1,10 @@
+{
+  "name": "software-dev",
+  "version": "1.0.0",
+  "description": "Software Development domain: testing strategy, API design, refactoring, database migrations, observability and CI/CD.",
+  "author": {
+    "name": "Samuel Oliveira"
+  },
+  "license": "MIT",
+  "keywords": ["software-development", "testing", "api", "refactoring", "observability", "ci-cd"]
+}

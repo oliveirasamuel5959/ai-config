@@ -1,0 +1,10 @@
+{
+  "name": "ai-config-core",
+  "version": "1.0.0",
+  "description": "Domain-agnostic skills, agents and commands shared by every project: verification discipline, code conventions, git commits, technical documentation and spec-driven development.",
+  "author": {
+    "name": "Samuel Oliveira"
+  },
+  "license": "MIT",
+  "keywords": ["core", "workflow", "code-quality", "git", "documentation"]
+}

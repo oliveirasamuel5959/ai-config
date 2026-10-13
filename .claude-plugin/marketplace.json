@@ -1,0 +1,27 @@
+{
+  "name": "ai-config",
+  "description": "Shared skills, agents and commands for Software Development and Data Science, for Claude Code and OpenCode.",
+  "owner": {
+    "name": "Samuel Oliveira"
+  },
+  "metadata": {
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ai-config-core",
+      "source": "./core",
+      "description": "Domain-agnostic skills, agents and commands: verify, code conventions, git commits, technical docs, spec-driven development."
+    },
+    {
+      "name": "software-dev",
+      "source": "./domains/software-dev",
+      "description": "Software Development domain: testing strategy, API design, refactoring, migrations, observability, CI/CD."
+    },
+    {
+      "name": "data-science",
+      "source": "./domains/data-science",
+      "description": "Data Science domain: exploratory analysis, cleaning, wrangling, transformation, visualization, SQL, classical ML, notebooks, pipelines and reporting."
+    }
+  ]
+}
