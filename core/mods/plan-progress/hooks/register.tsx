@@ -1,7 +1,28 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, RenderInput } from 'claude-code'
 
-import type { Goal, Phase, SessionRecord, TaskItem, View } from '../types'
+import type { Goal, Phase, TaskItem, ToolBucket, View } from '../types'
+import {
+  accrueTime,
+  addTurn,
+  churn,
+  countTurn,
+  emptyMetrics,
+  formatClock,
+  formatCost,
+  formatTokens,
+  levelOf,
+  LEVEL_COLOR,
+  noteName,
+  noteTool,
+  phaseTime,
+  remainingTo,
+  restartMetrics,
+  sparkline,
+  summaryText,
+  taskTime,
+  topNames,
+} from './metrics'
 import {
   PHASES,
   PHASE_COLOR,
@@ -25,6 +46,7 @@ import {
   phaseOfSkill,
   pickPhase,
   pushSignal,
+  scrollNote,
   shouldShowBand,
   truncate,
   OPENING,
@@ -33,26 +55,48 @@ import {
 } from './progress'
 
 const PANE = 'plan-progress'
-const OWNER = 'plan-progress'
 
 // Each reference spells `plugin` and `key` as literals: the engine's scan for
 // the contract reads them off the source, so a const holding them will not do.
 const goalAtom = atom({ plugin: 'plan-progress', key: 'goal' } as const, null)
 const tasksAtom = atom({ plugin: 'plan-progress', key: 'tasks' } as const, [])
 const signalsAtom = atom({ plugin: 'plan-progress', key: 'signals' } as const, [])
-const viewAtom = atom({ plugin: 'plan-progress', key: 'view' } as const, 'goal')
+const metricsAtom = atom({ plugin: 'plan-progress', key: 'metrics' } as const, emptyMetrics())
+const viewAtom = atom({ plugin: 'plan-progress', key: 'view' } as const, 'metrics')
 const tickAtom = atom({ plugin: 'plan-progress', key: 'nowTick' } as const, 0)
-const sessionsAtom = atom({ plugin: 'plan-progress', key: 'sessions' } as const, [])
 const hiddenAtom = atom({ plugin: 'plan-progress', key: 'isBandHidden' } as const, false)
 const wantedAtom = atom({ plugin: 'plan-progress', key: 'isPanelWanted' } as const, true)
+const bandMetricsAtom = atom({ plugin: 'plan-progress', key: 'isBandMetrics' } as const, true)
 const skillAtom = atom({ plugin: 'plan-progress', key: 'lastSkill' } as const, null)
 const agentAtom = atom({ plugin: 'plan-progress', key: 'lastAgent' } as const, null)
 
-/** A session record older than this is one that ended without saying so. */
-const STALE_MS = 24 * 60 * 60 * 1000
+/**
+ * A backstop on a list, not a window. The pane draws its rows whole and the
+ * surface's own window moves over them, told where it stands by
+ * `e.props.scroll` — so slicing to a small number here would put rows beyond
+ * it out of reach of the scroll rather than merely hiding them.
+ */
+const LIST_CAP = 200
 
-/** Rows of checklist the pane draws before it says how many it left out. */
-const MAX_ROWS = 40
+/**
+ * How long a live goal may go without a tool call before the panel mentions it.
+ * Dim and uncoloured: a long thinking turn is normal, not a fault — the line is
+ * there to say the session is still alive, not to raise an alarm.
+ */
+const QUIET_MS = 60_000
+
+/** The order tool kinds are listed in, so the row does not shuffle about. */
+const BUCKET_ORDER: readonly ToolBucket[] = [
+  'read',
+  'search',
+  'edit',
+  'shell',
+  'check',
+  'task',
+  'skill',
+  'agent',
+  'other',
+]
 
 /** How often the panel is asked for again while it waits to be placed. */
 const PLACE_RETRY_MS = 10_000
@@ -72,6 +116,22 @@ function phaseNow(signals: readonly Phase[], tasks: readonly TaskItem[]): Phase 
 async function signal($: $T, phase: Phase | undefined, weight = WEAK): Promise<void> {
   if (phase === undefined) return
   await update($, signalsAtom, list => pushSignal(list, phase, weight))
+}
+
+/**
+ * Banks the time up to `now` against the phase and the step that are current.
+ *
+ * Called wherever either can turn over — the once-a-second clock, and every
+ * observation that moves the phase — so the split is taken at the moment the
+ * work changed rather than at the next tick. A phase that lasts under a second
+ * is then still counted, and one that turns over mid-second is not credited
+ * with the seconds that followed it.
+ */
+async function bank($: $T, now: number): Promise<void> {
+  const tasks = await read($, tasksAtom)
+  const phase = phaseNow(await read($, signalsAtom), tasks)
+  const working = attributeTarget(tasks)
+  await update($, metricsAtom, m => accrueTime(m, now, phase, working?.id ?? null))
 }
 
 /** Repaints every site this plugin draws, after a change the readers missed. */
@@ -136,12 +196,11 @@ async function beginGoal(
     text: truncate(found.text, 400),
     startedAt: now,
     isExplicit: found.isExplicit,
-    turns: 0,
-    tools: 0,
   }
   await update($, goalAtom, () => goal)
   await update($, tasksAtom, () => [])
   await update($, signalsAtom, () => found.isExplicit ? ['planning' as Phase] : [])
+  await update($, metricsAtom, restartMetrics)
   await update($, skillAtom, () => null)
   await update($, agentAtom, () => null)
 }
@@ -154,74 +213,12 @@ async function settleGoal($: $T, tasks: readonly TaskItem[], now: number): Promi
   )
 }
 
-/** Writes this session's row for the "All tasks" view. */
-async function publish($: $T, now: number, isWorking: boolean): Promise<void> {
-  const id = await $.session.id()
-  const goal = await read($, goalAtom)
-  const tasks = await read($, tasksAtom)
-  const signals = await read($, signalsAtom)
-  const dir = await $.session.cwd()
-  const record: SessionRecord = {
-    id,
-    dir: dirName(dir),
-    goal: goal === null ? null : goal.text,
-    phase: phaseNow(signals, tasks),
-    done: countDone(tasks),
-    total: tasks.length,
-    startedAt: goal?.startedAt ?? now,
-    updatedAt: now,
-    isWorking,
-    isComplete: tasks.length > 0 && isComplete(tasks),
-  }
-  await $.store.set(`session:${id}`, record)
-}
-
-function parseRecord(raw: unknown): SessionRecord | undefined {
-  if (typeof raw !== 'object' || raw === null) return undefined
-  const row = raw as Record<string, unknown>
-  if (typeof row.id !== 'string' || typeof row.updatedAt !== 'number') return undefined
-  if (typeof row.phase !== 'string' || !PHASES.includes(row.phase as Phase)) return undefined
-  return {
-    id: row.id,
-    dir: typeof row.dir === 'string' ? row.dir : '',
-    goal: typeof row.goal === 'string' ? row.goal : null,
-    phase: row.phase as Phase,
-    done: typeof row.done === 'number' ? row.done : 0,
-    total: typeof row.total === 'number' ? row.total : 0,
-    startedAt: typeof row.startedAt === 'number' ? row.startedAt : row.updatedAt,
-    updatedAt: row.updatedAt,
-    isWorking: row.isWorking === true,
-    isComplete: row.isComplete === true,
-  }
-}
-
-/** Reads every other session's row, dropping the ones gone quiet. */
-async function refreshSessions($: $T, now: number): Promise<void> {
-  const own = await $.session.id()
-  const keys = await $.store.keys()
-  const rows: SessionRecord[] = []
-  for (const key of keys) {
-    if (!key.startsWith('session:')) continue
-    const record = parseRecord(await $.store.get(key))
-    if (record === undefined) continue
-    if (now - record.updatedAt > STALE_MS) {
-      await $.store.delete(key)
-      continue
-    }
-    // The panel already draws this session's own goal.
-    if (record.id === own) continue
-    rows.push(record)
-  }
-  rows.sort((a, b) => b.updatedAt - a.updatedAt)
-  await update($, sessionsAtom, () => rows)
-}
-
 /** The line naming the skill and the agent at work, when either is known. */
 function attributionLine(skill: string | null, agent: string | null): string {
   const parts: string[] = []
   if (skill !== null) parts.push(`skill ${skill}`)
   if (agent !== null) parts.push(`agent ${agent}`)
-  return parts.join('  ·  ')
+  return parts.join(' · ')
 }
 
 /**
@@ -244,29 +241,61 @@ async function placePanel($: $T): Promise<boolean> {
  * What the band draws while the monitor is hidden: one short line, and the
  * `show` that brings it back. Keeping this here is what makes `hide` safe —
  * without it, hiding would carry off the only control that could undo it.
+ *
+ * With the panel gone the figures come here too, so hiding the monitor is not
+ * the same as giving up the numbers; `/plan-progress band off` leaves the row
+ * as it was, naming nothing but the goal.
  */
 async function minimalRow($: $T, e: RenderInput<'AbovePrompt'>): Promise<RenderElement> {
   const { Box, Button, Text } = $.ui.resolve(e)
+  const isBandMetrics = await read($, bandMetricsAtom)
+  const metrics = isBandMetrics ? await read($, metricsAtom) : null
+  const fiveHour = metrics?.rateLimits.find(limit => limit.kind === 'five_hour')
+  const ctx = metrics?.context.percent ?? 0
+  const hasFigures =
+    metrics !== null &&
+    (metrics.tools > 0 || metrics.turns > 0 || ctx > 0 || metrics.rateLimits.length > 0)
+
   return (
-    <Box>
-      <Text dimColor>plan-progress </Text>
-      <Button
-        key="panel"
-        hotkey="p"
-        plain
-        onPress={() => {
-          void (async () => {
-            // `show` means show everything, as the command's does: hiding
-            // turned both off, so this turns both back on before asking.
-            await update($, hiddenAtom, () => false)
-            await update($, wantedAtom, () => true)
-            await placePanel($)
-            repaint($)
-          })()
-        }}
-      >
-        show
-      </Button>
+    <Box flexDirection="column">
+      <Box>
+        <Text dimColor>plan-progress </Text>
+        <Button
+          key="panel"
+          hotkey="p"
+          plain
+          onPress={() => {
+            void (async () => {
+              // `show` means show everything, as the command's does: hiding
+              // turned both off, so this turns both back on before asking.
+              await update($, hiddenAtom, () => false)
+              await update($, wantedAtom, () => true)
+              await placePanel($)
+              repaint($)
+            })()
+          }}
+        >
+          show
+        </Button>
+      </Box>
+      {hasFigures && metrics !== null && (
+        <Box>
+          <Text dimColor tabular>
+            ↑{formatTokens(metrics.tokens.input)} ↓{formatTokens(metrics.tokens.output)} ·{' '}
+            {formatCost(metrics.costUsd)}
+          </Text>
+          <Text color={LEVEL_COLOR[levelOf(ctx)]} tabular>
+            {' · ctx '}
+            {Math.round(ctx)}%
+          </Text>
+          {fiveHour !== undefined && (
+            <Text color={LEVEL_COLOR[levelOf(fiveHour.percentUsed)]} tabular>
+              {' · 5h '}
+              {Math.round(fiveHour.percentUsed)}%
+            </Text>
+          )}
+        </Box>
+      )}
     </Box>
   )
 }
@@ -274,15 +303,31 @@ async function minimalRow($: $T, e: RenderInput<'AbovePrompt'>): Promise<RenderE
 export const register: Register = (on, options) => {
   /** Whether the checklist was ever given by a real task list. */
   let isRunning = false
-  let ticks = 0
   let lastPlacedTryAt = Number.NEGATIVE_INFINITY
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'plan-progress',
       description: 'Show the running goal: phase, steps, progress and elapsed',
-      argumentHint: '[all|goal|hide|show|clear]',
+      argumentHint: '[metrics|goal|copy|band|hide|show|clear]',
     })
+
+    // The engine's own session figures, read once so the panel has the context
+    // and the cost before the first turn finishes. With no arguments — no
+    // breakdown asked for — this costs nothing.
+    const usage = await $.session.usage().catch(() => undefined)
+    if (usage !== undefined) {
+      await update($, metricsAtom, m => ({
+        ...m,
+        context: {
+          tokens: usage.context.tokens ?? 0,
+          window: usage.context.window,
+          percent: usage.context.percent ?? 0,
+        },
+        rateLimits: usage.rateLimits,
+        costUsd: usage.cost?.usd ?? m.costUsd,
+      }))
+    }
 
     // The panel is a monitor: it comes up with the session and stays docked
     // beside the transcript. Unasked it is placed only where the layout docks
@@ -293,20 +338,15 @@ export const register: Register = (on, options) => {
       $.ui.log('plan-progress: the panel waits undrawn until the terminal is wide enough.')
     }
 
-    // The clock redraws the elapsed time, and now and then republishes this
-    // session's row and re-reads the others.
+    // The clock redraws the elapsed time and banks each second against the
+    // phase and the step that are current.
     $.clock.every(1000, () => {
       void (async () => {
         const goal = await read($, goalAtom)
         if (goal === null || goal.endedAt !== undefined) return
-        ticks += 1
         await update($, tickAtom, value => value + 1)
         const now = await $.clock.now()
-        if (ticks % 15 === 0) await publish($, now, true).catch(() => {})
-        const view = await read($, viewAtom)
-        if (view === 'all' && ticks % 3 === 0) {
-          await refreshSessions($, now).catch(() => {})
-        }
+        await bank($, now)
       })().catch(() => {})
     })
 
@@ -329,11 +369,10 @@ export const register: Register = (on, options) => {
     if (name !== '' && name !== 'spec' && name !== 'goal') {
       await signal($, phaseOfCommand(name), OPENING)
     }
-    await update($, goalAtom, current =>
-      current === null ? current : { ...current, turns: current.turns + 1 },
-    )
+    // Counted here so the panel names the running turn, not the last finished.
+    await update($, metricsAtom, m => countTurn(m, e.agentId !== undefined))
+    await bank($, now)
     isRunning = true
-    await publish($, now, true).catch(() => {})
 
     return next(e)
   })
@@ -342,9 +381,36 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const tasks = await read($, tasksAtom)
     await settleGoal($, tasks, now)
-    await publish($, now, false).catch(() => {})
+    // What the turn cost and how long it took — read here, where the engine
+    // hands it over, rather than guessed at from the transcript.
+    await update($, metricsAtom, m =>
+      addTurn(m, {
+        usage: e.usage ?? undefined,
+        durationMs: e.durationMs,
+        isAborted: e.isAborted,
+        reason: e.reason,
+        isSubagent: e.agentId !== undefined,
+      }),
+    )
     await update($, tickAtom, value => value + 1)
 
+    return next(e)
+  })
+
+  // The engine pushes the live figures after each main-thread turn, and when a
+  // rate-limit window moves. There is nothing to compute or poll — the context
+  // window and the cost are the engine's own, as the status line shows them.
+  on('session.measure', async ($, e, next) => {
+    await update($, metricsAtom, m => ({
+      ...m,
+      context: {
+        tokens: e.context.tokens ?? 0,
+        window: e.context.window,
+        percent: e.context.percent ?? 0,
+      },
+      rateLimits: e.rateLimits,
+      costUsd: e.cost?.usd ?? m.costUsd,
+    }))
     return next(e)
   })
 
@@ -415,10 +481,16 @@ export const register: Register = (on, options) => {
   // weak evidence — one read in the middle of an edit says little.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
+    const now = await $.clock.now()
     const call = e as unknown as { tool: string; [k: string]: unknown }
     const phase = phaseOfCall(call)
     const isNamed = e.tool === 'Skill' || e.tool === 'Agent'
     await signal($, phase, isNamed ? STRONG : WEAK)
+    // Counted after the call ran, so its own verdict — `isError` — is known.
+    await update($, metricsAtom, m => noteTool(m, e.tool, call, ran.isError === true, now))
+    // The call may have moved the phase; bank the time up to it now, so the
+    // phase it left is credited with the seconds it actually held.
+    await bank($, now)
 
     if (e.agentId === undefined) {
       if (e.tool === 'Skill' && typeof e.skill === 'string') {
@@ -430,9 +502,6 @@ export const register: Register = (on, options) => {
         await attributeAgent($, type)
       }
     }
-    await update($, goalAtom, goal =>
-      goal === null ? goal : { ...goal, tools: goal.tools + 1 },
-    )
     return ran
   }).catch(($, e, next) => (next.called ? next(e) : next(e)))
 
@@ -440,6 +509,7 @@ export const register: Register = (on, options) => {
     const phase = phaseOfSkill(e.skill)
     await signal($, phase, STRONG)
     await attributeSkill($, e.skill)
+    await update($, metricsAtom, m => noteName(m, 'skills', e.skill))
     return next(e)
   })
 
@@ -457,19 +527,50 @@ export const register: Register = (on, options) => {
   on('agent.spawn', async ($, e, next) => {
     await signal($, phaseOfAgent(e.subagentType), STRONG)
     await attributeAgent($, e.subagentType)
+    await update($, metricsAtom, m => noteName(m, 'agents', e.subagentType))
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'plan-progress' }, async ($, e) => {
     const arg = (e.args ?? '').trim().toLowerCase()
-    const now = await $.clock.now()
 
     if (arg === 'clear') {
       await update($, goalAtom, () => null)
       await update($, tasksAtom, () => [])
       await update($, signalsAtom, () => [])
-      await $.store.delete(`session:${await $.session.id()}`)
+      await update($, metricsAtom, emptyMetrics)
       return { text: 'Plan Progress: cleared.' }
+    }
+    if (arg === 'copy') {
+      const now = await $.clock.now()
+      const metrics = await read($, metricsAtom)
+      const tasks = await read($, tasksAtom)
+      const goal = await read($, goalAtom)
+      const text = summaryText({
+        goal: goal?.text ?? null,
+        phase: phaseNow(await read($, signalsAtom), tasks),
+        done: countDone(tasks),
+        total: tasks.length,
+        elapsedMs: goal === null ? 0 : elapsedOf(goal, now),
+        metrics,
+      })
+      const copied = await $.ui.copy({ text }).catch(() => undefined)
+      return {
+        text:
+          copied?.isCopied === true
+            ? 'Plan Progress: the summary is on the clipboard.'
+            : 'Plan Progress: nothing to copy into on this surface.',
+      }
+    }
+    if (arg === 'band' || arg.startsWith('band ')) {
+      const want = arg.slice('band'.length).trim() !== 'off'
+      await update($, bandMetricsAtom, () => want)
+      repaint($)
+      return {
+        text: want
+          ? 'Plan Progress: the row carries the figures while the panel is hidden.'
+          : 'Plan Progress: the row carries the goal alone.',
+      }
     }
     if (arg === 'hide') {
       // The master switch: the panel goes, and so does the row that would
@@ -492,19 +593,22 @@ export const register: Register = (on, options) => {
       }
     }
 
-    const view: View = arg === 'all' ? 'all' : 'goal'
+    // No argument opens the numbers: that is what the panel is for now.
+    const view: View = arg === 'goal' ? 'goal' : 'metrics'
     await update($, viewAtom, () => view)
-    if (view === 'all') await refreshSessions($, now).catch(() => {})
     const opened = await placePanel($)
-    const goal = await read($, goalAtom)
-    const label = view === 'all' ? 'All tasks' : 'Plan Progress'
     if (!opened) {
-      return { text: `${label}: widen the terminal to see the panel.` }
+      return { text: 'Plan Progress: widen the terminal to see the panel.' }
     }
-    if (view === 'goal' && !hasGoal(goal)) {
+    if (view === 'goal' && !hasGoal(await read($, goalAtom))) {
       return { text: 'Plan Progress: no goal is running yet. Start one, or try /spec.' }
     }
-    return { text: `${label} is open.` }
+    return {
+      text:
+        view === 'goal'
+          ? 'Plan Progress: the checklist is open.'
+          : 'Plan Progress: the metrics are open.',
+    }
   })
 
   // The panel deliberately has no `ui.close` hook. A hook that answers without
@@ -565,18 +669,20 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column">
         <Box>
-          <Text color={PHASE_COLOR[phase]} bold>
+          <Text color={PHASE_COLOR[phase]} weight="semibold">
             {done ? '✓ done' : `◆ ${phase}`}{' '}
           </Text>
           <Text dimColor>{truncate(goal?.text ?? '', room)}</Text>
         </Box>
         <Box>
           <Text color={PHASE_COLOR[phase]}>{bar(fractionOf(percent), width)}</Text>
-          <Text> {percent}% </Text>
-          <Text dimColor>
+          <Text tabular> {percent}% </Text>
+          <Text dimColor tabular>
             {countDone(tasks)}/{tasks.length} · {elapsed}
-            {current === undefined ? '' : ` · ${truncate(current.subject, 28)}`}
           </Text>
+          {current !== undefined && (
+            <Text dimColor> · {truncate(current.subject, 28)}</Text>
+          )}
           <Button
             key="panel"
             hotkey="p"
@@ -616,29 +722,25 @@ export const register: Register = (on, options) => {
     const tabs = (
       <Box>
         <Button
-          key="tab-goal"
+          key="tab-metrics"
           plain
           hotkey="1"
+          onPress={() => {
+            void update($, viewAtom, () => 'metrics').then(() => repaint($))
+          }}
+        >
+          <Text weight={view === 'metrics' ? 'semibold' : 'regular'}>Metrics</Text>
+        </Button>
+        <Text dimColor> | </Text>
+        <Button
+          key="tab-goal"
+          plain
+          hotkey="2"
           onPress={() => {
             void update($, viewAtom, () => 'goal').then(() => repaint($))
           }}
         >
-          <Text bold={view === 'goal'}>Goal</Text>
-        </Button>
-        <Text dimColor> | </Text>
-        <Button
-          key="tab-all"
-          plain
-          hotkey="2"
-          onPress={() => {
-            void (async () => {
-              await update($, viewAtom, () => 'all')
-              await refreshSessions($, await $.clock.now())
-              repaint($)
-            })()
-          }}
-        >
-          <Text bold={view === 'all'}>All tasks</Text>
+          <Text weight={view === 'goal' ? 'semibold' : 'regular'}>Goal</Text>
         </Button>
         <Text dimColor>   </Text>
         <Button
@@ -662,51 +764,229 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
-    if (view === 'all') {
-      const sessions = await read($, sessionsAtom)
+    if (view === 'metrics') {
+      const metrics = await read($, metricsAtom)
+      const tasks = await read($, tasksAtom)
+      const goal = await read($, goalAtom)
+      const width = barWidth(columns)
+      // Four figures across need room for two label/value columns and the gap.
+      const isWide = columns >= 64
+
+      const spent = metrics.tokens
+      const totalSpent = spent.input + spent.output + spent.cacheRead + spent.cacheWrite
+      const live = goal !== null && goal.endedAt === undefined
+      const quiet = live && metrics.lastToolAt > 0 ? now - metrics.lastToolAt : 0
+
+      const times = PHASES.map(name => ({
+        name,
+        ms: phaseTime(metrics, name, now),
+      }))
+        // The phase in progress is always listed, even before it has earned a
+        // second: the panel should say where the work is, not only where it was.
+        .filter(entry => entry.ms > 0 || entry.name === metrics.openPhase)
+        .sort((a, b) => b.ms - a.ms)
+      const totalTime = times.reduce((sum, entry) => sum + entry.ms, 0)
+
+      const buckets = BUCKET_ORDER.map(bucket => ({
+        bucket,
+        count: metrics.toolsByBucket[bucket] ?? 0,
+      })).filter(entry => entry.count > 0)
+
+      const skills = topNames(metrics.skills)
+      const agents = topNames(metrics.agents)
+      const churned = churn(metrics.editCounts)
+      const troubles = [
+        metrics.failedTools > 0
+          ? `${metrics.failedTools} failed ${metrics.failedTools === 1 ? 'call' : 'calls'}`
+          : null,
+        metrics.erroredTurns > 0
+          ? `${metrics.erroredTurns} errored ${metrics.erroredTurns === 1 ? 'turn' : 'turns'}`
+          : null,
+        metrics.abortedTurns > 0 ? `${metrics.abortedTurns} aborted` : null,
+      ].filter((part): part is string => part !== null)
+
+      // A label and its figure. Padded rather than flexed, so the columns line
+      // up down the pane the way a table of figures should.
+      const row = (label: string, value: string, right?: string, rightValue?: string) => (
+        <Box>
+          <Text dimColor>{`  ${label.padEnd(7)}`}</Text>
+          <Text tabular>{value.padStart(9)}</Text>
+          {right !== undefined && rightValue !== undefined && (
+            <Text dimColor>{`    ${right.padEnd(7)}`}</Text>
+          )}
+          {right !== undefined && rightValue !== undefined && (
+            <Text tabular>{rightValue.padStart(9)}</Text>
+          )}
+        </Box>
+      )
+
+      const onePerLine = (left: [string, string], right: [string, string]) =>
+        isWide ? row(left[0], left[1], right[0], right[1]) : (
+          <>
+            {row(left[0], left[1])}
+            {row(right[0], right[1])}
+          </>
+        )
+
       return (
         <Box flexDirection="column">
           {tabs}
-          <Text dimColor>
-            {'─'.repeat(Math.max(1, Math.min(columns, 60)))}
-          </Text>
-          {sessions.length === 0 && (
-            <Text dimColor>No other session is running a goal.</Text>
-          )}
-          {sessions.slice(0, MAX_ROWS).map(session => {
-            const percent =
-              session.total === 0 ? 0 : Math.round((session.done / session.total) * 100)
-            const width = barWidth(columns)
-            const mark = session.isWorking ? '●' : session.isComplete ? '✓' : '○'
-            return (
-              <Box key={session.id} flexDirection="column">
-                <Box>
-                  <Text color={PHASE_COLOR[session.phase]} bold>
-                    {mark}{' '}
-                  </Text>
-                  <Text>{truncate(session.goal ?? '(no goal)', Math.max(10, columns - 6))}</Text>
-                </Box>
-                <Box>
-                  <Text>{'   '}</Text>
-                  <Text color={PHASE_COLOR[session.phase]}>{bar(fractionOf(percent), width)}</Text>
-                  <Text bold> {String(percent).padStart(3)}%</Text>
-                  <Text dimColor>
-                    {'  '}
-                    {session.phase}
-                    {' · '}
-                    {session.done}/{session.total}
-                    {' · '}
-                    {formatAge(now - session.updatedAt)}
-                    {' · '}
-                    {session.dir}
-                  </Text>
-                </Box>
+          <Text dimColor>{'─'.repeat(Math.max(1, Math.min(columns, 60)))}</Text>
+
+          {!hasGoal(goal) && metrics.tools === 0 ? (
+            <Text dimColor>Nothing measured yet — run something and the numbers fill in.</Text>
+          ) : (
+            <>
+              <Text weight="semibold">Tokens</Text>
+              {onePerLine(
+                ['in', formatTokens(spent.input)],
+                ['out', formatTokens(spent.output)],
+              )}
+              {onePerLine(
+                ['cache', formatTokens(spent.cacheRead + spent.cacheWrite)],
+                ['total', formatTokens(totalSpent)],
+              )}
+              {onePerLine(
+                ['cost', formatCost(metrics.costUsd)],
+                ['turns', String(metrics.turns)],
+              )}
+              <Text dimColor tabular>
+                {'  turns '}
+                {String(metrics.turns).padStart(3)}
+                {'  '}
+                {sparkline(metrics.turnDurations, Math.max(8, Math.min(width, 32)))}
+              </Text>
+
+              <Text> </Text>
+              <Text weight="semibold">Context</Text>
+              <Box>
+                <Text color={LEVEL_COLOR[levelOf(metrics.context.percent)]} tabular>
+                  {`  ${String(Math.round(metrics.context.percent)).padStart(3)}%`}
+                </Text>
+                <Text color={LEVEL_COLOR[levelOf(metrics.context.percent)]}>
+                  {`  ${bar(metrics.context.percent / 100, width)}`}
+                </Text>
+                <Text dimColor tabular>
+                  {`  ${formatTokens(metrics.context.tokens)} / ${formatTokens(metrics.context.window)}`}
+                </Text>
               </Box>
-            )
-          })}
-          {sessions.length > MAX_ROWS && (
-            <Text dimColor>… {sessions.length - MAX_ROWS} more</Text>
+
+              <Text> </Text>
+              <Text weight="semibold">Limits</Text>
+              {metrics.rateLimits.length === 0 && (
+                <Text dimColor>  no window reported</Text>
+              )}
+              {metrics.rateLimits.map(limit => {
+                const level = levelOf(limit.percentUsed)
+                const left = remainingTo(limit.resetsAt, now)
+                const label =
+                  limit.kind === 'five_hour'
+                    ? '5h'
+                    : limit.kind === 'seven_day'
+                      ? '7d'
+                      : truncate(limit.kind, 6)
+                return (
+                  <Box key={limit.kind}>
+                    <Text dimColor>{`  ${label.padEnd(4)}`}</Text>
+                    <Text color={LEVEL_COLOR[level]} tabular>
+                      {`${String(Math.round(limit.percentUsed)).padStart(3)}%`}
+                    </Text>
+                    <Text color={LEVEL_COLOR[level]}>{`  ${bar(limit.percentUsed / 100, width)}`}</Text>
+                    {left !== null && left > 0 && (
+                      <Text dimColor tabular>
+                        {`  resets ${formatClock(now + left)} (${formatAge(left)})`}
+                      </Text>
+                    )}
+                  </Box>
+                )
+              })}
+
+              <Text> </Text>
+              <Text weight="semibold">Time by phase</Text>
+              {times.length === 0 && <Text dimColor>  nothing has run yet</Text>}
+              {times.map(entry => {
+                const share = totalTime === 0 ? 0 : entry.ms / totalTime
+                return (
+                  <Box key={entry.name}>
+                    <Text dimColor>{`  ${entry.name.padEnd(11)}`}</Text>
+                    <Text tabular>{formatElapsed(entry.ms).padStart(8)}</Text>
+                    <Text color={PHASE_COLOR[entry.name]}>{`  ${bar(share, width)}`}</Text>
+                    <Text dimColor tabular>
+                      {`  ${String(Math.round(share * 100)).padStart(3)}%`}
+                    </Text>
+                  </Box>
+                )
+              })}
+
+              <Text> </Text>
+              <Text weight="semibold">Activity</Text>
+              <Box>
+                <Text dimColor>{`  ${String(metrics.tools).padStart(4)} tools`}</Text>
+              </Box>
+              {buckets.length > 0 && (
+                <Box>
+                  <Text dimColor>{'  '}</Text>
+                  <Text tabular>
+                    {buckets.map(entry => `${entry.bucket} ${entry.count}`).join(' · ')}
+                  </Text>
+                </Box>
+              )}
+              {skills.length > 0 && (
+                <Box>
+                  <Text dimColor>{'  skills '}</Text>
+                  <Text>{skills.join(' · ')}</Text>
+                </Box>
+              )}
+              {agents.length > 0 && (
+                <Box>
+                  <Text dimColor>{'  agents '}</Text>
+                  <Text>{agents.join(' · ')}</Text>
+                </Box>
+              )}
+              {churned.length > 0 && (
+                <Box>
+                  <Text dimColor>{'  churn  '}</Text>
+                  <Text color="warning">
+                    {churned
+                      .map(entry => `${dirName(entry.path)} ×${entry.count}`)
+                      .join(' · ')}
+                  </Text>
+                </Box>
+              )}
+
+              <Text> </Text>
+              <Text weight="semibold">Health</Text>
+              <Box>
+                <Text color={metrics.checks.failed > 0 ? 'error' : 'success'}>
+                  {metrics.checks.failed > 0 ? '  ⚠ ' : '  ✓ '}
+                </Text>
+                <Text tabular>
+                  {metrics.checks.runs}{' '}
+                  {metrics.checks.runs === 1 ? 'check' : 'checks'}, {metrics.checks.failed} failed
+                </Text>
+              </Box>
+              {troubles.length > 0 && (
+                <Box>
+                  <Text color="warning">{'  ⚠ '}</Text>
+                  <Text dimColor tabular>
+                    {troubles.join(' · ')}
+                  </Text>
+                </Box>
+              )}
+              {quiet > QUIET_MS && (
+                <Box>
+                  <Text dimColor>
+                    {'  no tool call for '}
+                    {formatAge(quiet)}
+                  </Text>
+                </Box>
+              )}
+            </>
           )}
+
+          <Text dimColor>
+            /plan-progress goal · copy · band · hide · show · clear
+          </Text>
         </Box>
       )
     }
@@ -715,6 +995,7 @@ export const register: Register = (on, options) => {
     const tasks = await read($, tasksAtom)
     const skill = await read($, skillAtom)
     const agent = await read($, agentAtom)
+    const metrics = await read($, metricsAtom)
     const phase = phaseNow(await read($, signalsAtom), tasks)
     const percent = percentOf(tasks)
     const width = barWidth(columns)
@@ -722,6 +1003,7 @@ export const register: Register = (on, options) => {
     const done = goal !== null && goal.endedAt !== undefined
     const attribution = attributionLine(skill, agent)
     const hasSteps = tasks.length > 0
+    const note = scrollNote(e.props.scroll.offset, e.props.scroll.bodyRows, tasks.length)
 
     if (!hasGoal(goal)) {
       return (
@@ -739,18 +1021,24 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column">
         {tabs}
         <Text dimColor>{'─'.repeat(Math.max(1, Math.min(columns, 60)))}</Text>
+        {note !== null && <Text dimColor>{note}</Text>}
         <Box>
-          <Text bold>Goal  </Text>
+          <Text weight="semibold">Goal  </Text>
           <Text>{truncate(goal?.text ?? '', Math.max(12, columns - 8))}</Text>
         </Box>
         <Box>
-          <Text bold>Phase </Text>
-          <Text color={PHASE_COLOR[phase]} bold>
+          <Text weight="semibold">Phase </Text>
+          <Text color={PHASE_COLOR[phase]} weight="semibold">
             {phase}
           </Text>
-          {done && <Text color="success" bold>  complete</Text>}
+          {done && (
+            <Text color="success" weight="semibold">
+              {' '}
+              complete
+            </Text>
+          )}
           {attribution.length > 0 && (
-            <Text dimColor>  ·  {truncate(attribution, Math.max(8, columns - 24))}</Text>
+            <Text dimColor> · {truncate(attribution, Math.max(8, columns - 24))}</Text>
           )}
         </Box>
         {/* A goal with no checklist yet has no progress to draw: the panel
@@ -758,20 +1046,20 @@ export const register: Register = (on, options) => {
         {hasSteps && (
           <Box>
             <Text color={PHASE_COLOR[phase]}>{bar(fractionOf(percent), width)}</Text>
-            <Text bold> {String(percent).padStart(3)}%</Text>
-            <Text dimColor>
+            <Text tabular weight="semibold">
+              {' '}
+              {String(percent).padStart(3)}%
+            </Text>
+            <Text dimColor tabular>
               {'  '}
-              {countDone(tasks)}/{tasks.length} steps
-              {'  ·  '}
-              {formatElapsed(elapsedOf(goal as Goal, now))}
-              {'  ·  '}
-              {goal?.turns ?? 0} {(goal?.turns ?? 0) === 1 ? 'turn' : 'turns'}
+              {countDone(tasks)}/{tasks.length} steps · {formatElapsed(elapsedOf(goal as Goal, now))} ·{' '}
+              {metrics.turns} {metrics.turns === 1 ? 'turn' : 'turns'}
             </Text>
           </Box>
         )}
         <Text> </Text>
         <Box>
-          <Text bold>Steps</Text>
+          <Text weight="semibold">Steps</Text>
           {current !== undefined && (
             <Text dimColor>
               {'  '}
@@ -784,42 +1072,51 @@ export const register: Register = (on, options) => {
             No checklist yet — Claude writes one once the work is broken down.
           </Text>
         )}
-        {tasks.slice(0, MAX_ROWS).map(task => (
-          <Box key={task.id}>
-            <Text
-              color={
-                task.status === 'completed'
-                  ? 'success'
-                  : task.status === 'in_progress'
-                    ? 'claude'
-                    : undefined
-              }
-            >
-              {task.status === 'completed' ? ' ✓ ' : task.status === 'in_progress' ? ' ▶ ' : ' ○ '}
-            </Text>
-            <Text dimColor={task.status === 'completed'} bold={task.status === 'in_progress'}>
-              {truncate(task.subject, Math.max(16, columns - 26))}
-            </Text>
-            {(task.skill !== undefined || task.agent !== undefined) && (
-              <Text dimColor>
-                {'  '}
-                {task.skill !== undefined ? `@${task.skill}` : ''}
-                {task.skill !== undefined && task.agent !== undefined ? ' ' : ''}
-                {task.agent !== undefined ? `◇${task.agent}` : ''}
+        {tasks.slice(0, LIST_CAP).map(task => {
+          const stepMs = taskTime(metrics, task.id, now)
+          return (
+            <Box key={task.id}>
+              <Text
+                color={
+                  task.status === 'completed'
+                    ? 'success'
+                    : task.status === 'in_progress'
+                      ? 'claude'
+                      : undefined
+                }
+              >
+                {task.status === 'completed' ? ' ✓ ' : task.status === 'in_progress' ? ' ▶ ' : ' ○ '}
               </Text>
-            )}
-          </Box>
-        ))}
-        {tasks.length > MAX_ROWS && <Text dimColor>… {tasks.length - MAX_ROWS} more</Text>}
+              <Text
+                dimColor={task.status === 'completed'}
+                weight={task.status === 'in_progress' ? 'semibold' : 'regular'}
+              >
+                {truncate(task.subject, Math.max(16, columns - 26))}
+              </Text>
+              {/* How long the step took — banked once it turns over, and
+                  counting up live while it is the one being worked on. */}
+              {stepMs > 0 && (
+                <Text dimColor tabular>
+                  {'  '}
+                  {formatElapsed(stepMs)}
+                </Text>
+              )}
+              {(task.skill !== undefined || task.agent !== undefined) && (
+                <Text dimColor>
+                  {'  '}
+                  {task.skill !== undefined ? `@${task.skill}` : ''}
+                  {task.skill !== undefined && task.agent !== undefined ? ' ' : ''}
+                  {task.agent !== undefined ? `◇${task.agent}` : ''}
+                </Text>
+              )}
+            </Box>
+          )
+        })}
+        {tasks.length > LIST_CAP && <Text dimColor>… {tasks.length - LIST_CAP} more</Text>}
         <Text dimColor>
-          /plan-progress all · hide · show · clear — hide takes the panel and the row away
+          /plan-progress metrics · copy · band · hide · show · clear
         </Text>
       </Box>
     )
-  })
-
-  on('session.end', async ($, e, next) => {
-    await $.store.delete(`session:${e.sessionId}`).catch(() => {})
-    return next(e)
   })
 }

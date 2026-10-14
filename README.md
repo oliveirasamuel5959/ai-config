@@ -56,7 +56,7 @@ prompt. They live under `core/mods/`, one folder per mod, and each is a plugin r
 
 | Mod | What it does |
 | --- | --- |
-| `plan-progress` | A pane and prompt band showing the running goal: its phase, the step checklist, a progress bar, elapsed time, and the skill and agent at work on the current step. `/plan-progress [all\|goal\|hide\|show\|clear]`. |
+| `plan-progress` | A pane and prompt band tracking the running goal: a **Metrics** tab (tokens and cost, context window, rate limits, time by phase, tool/skill/agent activity, health) and a **Goal** tab with its phase, step checklist, progress bar and elapsed time. `/plan-progress [metrics\|goal\|copy\|band\|hide\|show\|clear]`. |
 
 ## `sync.sh`
 

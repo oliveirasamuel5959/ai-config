@@ -60,7 +60,10 @@ Authoring rules:
 - `.claude-plugin/plugin.json` names the mod, its version and its `types` contract.
 - `hooks/hooks.json` lists the module; `hooks/register.tsx` holds `export const register: Register`.
   `hooks/progress.ts` is the other half — the pure part, turning observations into a phase, a
-  checklist and a bar, with no `$` in sight. `hooks/register.test.ts` covers both.
+  checklist and a bar, with no `$` in sight. `hooks/metrics.ts` is a second pure module holding the
+  accounting: what a turn cost, where the time went, what went wrong. `hooks/register.test.ts` covers
+  register with a mocked engine; `hooks/progress.test.ts` and `hooks/metrics.test.ts` cover the pure
+  two directly.
 - Every value the mod keeps in `$.state` is declared in `types/index.d.ts`, which the module imports
   its value types from. Keep it hand-written; it is the contract, not a build artifact.
 - `.claude-plugin/types/` is a *different* directory and is **engine-written** — the API
