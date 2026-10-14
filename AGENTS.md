@@ -14,6 +14,7 @@ core/                    domain-agnostic artifacts (both domains get these)
   agents/opencode/*.md   OpenCode agents (separate frontmatter)
   commands/*.md          shared commands
   commands/opencode/*.md OpenCode command variants
+  mods/<name>/           Claude Code mods, each its own plugin root
 domains/
   software-dev/          same structure as core/
   data-science/          same structure as core/
@@ -40,6 +41,30 @@ sync.sh                  installer
 
    Both files carry the identical body text. `agents/opencode/` exists only for OpenCode and is
    never installed into `~/.claude/agents/`.
+
+## Mods
+
+A **mod** changes Claude's own interface — a pane, a band above the prompt, a slash command of its
+own. Mods are **Claude Code only**: they are TypeScript modules registered against the `claude-code`
+API, so there is no OpenCode counterpart to keep in step, and `sync.sh` does not install them.
+Each lives at `core/mods/<name>/` as a plugin root of its own, wired into the marketplace as a
+fourth plugin entry — that is how it reaches another machine:
+
+```
+/plugin install plan-progress@ai-config
+```
+
+Authoring rules:
+
+- `.claude-plugin/plugin.json` names the mod, its version and its `types` contract.
+- `hooks/hooks.json` lists the module; `hooks/register.tsx` holds `export const register: Register`.
+- Every value the mod keeps in `$.state` is declared in `types/index.d.ts`, which the module imports
+  its value types from. Keep it hand-written; it is the contract, not a build artifact.
+- `.claude-plugin/types/` is **engine-written** — the API declarations for the installed Claude Code
+  version, regenerated on load. It is gitignored from inside and never committed.
+- The mod's top-level `tsconfig.json` does travel: it extends that generated config for `tsc -p`.
+
+Verify a mod with `claude plugin validate core/mods/<name>` and `claude plugin test core/mods/<name>`.
 
 ## Why `core/` and each domain are Claude plugin roots
 

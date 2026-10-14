@@ -22,6 +22,11 @@
       "name": "data-science",
       "source": "./domains/data-science",
       "description": "Data Science domain: exploratory analysis, cleaning, wrangling, transformation, visualization, SQL, classical ML, notebooks, pipelines and reporting."
+    },
+    {
+      "name": "plan-progress",
+      "source": "./core/mods/plan-progress",
+      "description": "A live panel of the running goal: phase, task checklist, progress and the skills and agents at work."
     }
   ]
 }

@@ -32,6 +32,7 @@ Every domain profile includes `core`.
 
 ```
 core/                      domain-agnostic — a component root and a Claude plugin root
+  mods/<name>/             Claude Code mods, each its own plugin root
 domains/software-dev/      Software Development domain
 domains/data-science/      Data Science domain
 plugins/opencode/          OpenCode TypeScript plugins (memory)
@@ -42,6 +43,20 @@ sync.sh                    the installer
 Each component root holds `skills/<name>/SKILL.md`, `agents/*.md`, `commands/*.md`, and the
 per-tool agent variants under `opencode/agents/`. See [AGENTS.md](AGENTS.md) for the authoring rules
 that keep this DRY across two tools.
+
+## Mods
+
+Claude Code **mods** are plugins that change the interface itself — a live pane, a band above the
+prompt. They live under `core/mods/`, one folder per mod, and each is a plugin root of its own.
+`sync.sh` does not install them; they come from the marketplace:
+
+```
+/plugin install plan-progress@ai-config
+```
+
+| Mod | What it does |
+| --- | --- |
+| `plan-progress` | A pane and prompt band showing the running goal: its phase, the step checklist, a progress bar, elapsed time, and the skill and agent at work on the current step. `/plan-progress [all\|goal\|hide\|show\|clear]`. |
 
 ## `sync.sh`
 
