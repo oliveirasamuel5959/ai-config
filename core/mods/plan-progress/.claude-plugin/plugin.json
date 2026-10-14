@@ -1,6 +1,6 @@
 {
   "name": "plan-progress",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A live panel of the running goal: phase, task checklist, progress and the skills and agents at work.",
   "author": {
     "name": "Samuel Oliveira"

@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import type { SessionRecord, TaskItem } from '../types'
+import type { TaskItem } from '../types'
 
 const PLUGIN = 'plan-progress'
 const PANE = 'plan-progress'
@@ -30,7 +30,7 @@ type TestOn = On
 
 /**
  * The world a session gives the mod: an id, a directory, a clock the test
- * moves, an in-memory store, and a bottom that answers what is called on it.
+ * moves, and a bottom that answers what is called on it.
  *
  * The pane bookkeeping is real, so what `$.ui.open`, `$.ui.close` and
  * `$.ui.panes` do to each other is what a session does: hiding closes the
@@ -40,14 +40,8 @@ type TestOn = On
  * Every hook beneath the plugins is registered here, before the test's first
  * call on `$`: the kit asks for them once, when the plugins load.
  */
-function world(
-  $: Test$,
-  on: TestOn,
-  records: Record<string, SessionRecord> = {},
-  canPlace = true,
-) {
+function world($: Test$, on: TestOn, canPlace = true) {
   const clock = mock.clock(on)
-  mock.store(on, records as Record<string, unknown>)
   const panes = new Set<string>()
   const answer = () =>
     canPlace
@@ -56,9 +50,23 @@ function world(
 
   on('session.id', () => ({ value: 's-1' }))
   on('session.cwd', () => ({ value: '/home/sam/projects/demo' }))
+  on('session.start', () => ({ cwd: '/home/sam/projects/demo' }))
+  // The engine pushes these after each main-thread turn.
+  on('session.measure', () => ({ changed: [] }))
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: { tokens: 0, window: 200_000, percent: 0 },
+      rateLimits: [],
+      cost: { usd: 0 },
+    },
+  }))
   on('turn.start', () => ({ turnId: 't1' }))
   on('turn.complete', () => ({ text: 'ok' }))
-  on('tool.call', () => ({ result: null }))
+  // Flipped by a test that wants a tool call to come back failed, which is how
+  // the engine reports one: `isError` on the call's own result.
+  const toolFailures = { value: false }
+  on('tool.call', () => ({ result: null, isError: toolFailures.value }))
   on('ui.open', () => {
     if (canPlace) panes.add(PANE)
     return answer()
@@ -77,10 +85,35 @@ function world(
     })),
   }))
   on('command.run', () => ({ text: 'ran' }))
+  // Flipped by a test that wants the clipboard refused, as a surface without
+  // one answers.
+  const copyFails = { value: false }
+  on('ui.copy', () => ({
+    value: copyFails.value
+      ? ({ isCopied: false, reason: 'no-surface' } as const)
+      : ({ isCopied: true } as const),
+  }))
   // The bottom the band's own drawing lands on, so a mount is answered from
   // beneath the plugin rather than running off the end of the chain.
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Box' as const }))
-  return { clock, panes }
+  return { clock, panes, toolFailures, copyFails }
+}
+
+/** Pushes the live session figures, as the engine does after a main-thread turn. */
+function measured(
+  $: Test$,
+  figures: {
+    context?: { tokens?: number; window: number; percent?: number }
+    rateLimits?: readonly { kind: string; percentUsed: number; resetsAt?: string }[]
+    cost?: { usd: number }
+  },
+) {
+  return $.session.measure({
+    context: { tokens: 0, window: 200_000, percent: 0, ...figures.context },
+    rateLimits: [...(figures.rateLimits ?? [])],
+    cost: figures.cost,
+    changed: ['context', 'cost', 'rateLimits'],
+  })
 }
 
 async function todo(
@@ -104,14 +137,20 @@ function run($: Test$, args: string) {
   })
 }
 
-function pane($: Test$) {
-  return $.ui.mount({
+/**
+ * The pane, showing the tab asked for. It opens on the metrics — the numbers
+ * are what the panel is for now — so the checklist is one press away.
+ */
+async function pane($: Test$, tab: 'goal' | 'metrics' = 'goal') {
+  const ui = await $.ui.mount({
     plugin: PLUGIN,
     surface: 'terminal' as const,
     component: 'Pane' as const,
     props: PANE_PROPS,
     requestId: PANE,
   })
+  if (tab === 'goal') await ui.press({ key: 'tab-goal' })
+  return ui
 }
 
 function band($: Test$, props: Partial<typeof BAND_PROPS> = {}, requestId = 'band') {
@@ -421,63 +460,137 @@ describe('the skill and the agent at work', () => {
   })
 })
 
-describe('the All tasks view', () => {
-  test('lists another session running a goal, with its progress', async ($, on) => {
-    const other: SessionRecord = {
-      id: 's-2',
-      dir: 'other-project',
-      goal: 'migrate the schema',
-      phase: 'testing',
-      done: 3,
-      total: 4,
-      startedAt: 0,
-      updatedAt: 0,
-      isWorking: true,
-      isComplete: false,
-    }
-    world($, on, { 'session:s-2': other })
-    await $.turn.start({ text: '/spec my own goal', turnId: 't1' })
-
-    const ui = await pane($)
-    await ui.press({ key: 'tab-all' })
-    expect((await ui.find({ text: /migrate the schema/ }))?.text).toContain('migrate the schema')
-    expect((await ui.find({ text: /other-project/ }))?.text).toContain('other-project')
-    expect((await ui.find({ text: /75%/ }))?.text).toContain('75%')
-    // This session's own goal is not in the list twice.
-    expect(await ui.find({ text: /my own goal/ })).toBeUndefined()
-    await ui.unmount()
-  })
-
-  test('says so plainly when no other session is running one', async ($, on) => {
+describe('the metrics', () => {
+  test("a turn's usage and the session's own figures reach the pane", async ($, on) => {
     world($, on)
-    await $.turn.start({ text: '/spec alone here', turnId: 't1' })
+    await $.turn.start({ text: '/spec watch the spend', turnId: 't1' })
+    await $.turn.complete({
+      ...finished(),
+      usage: {
+        input_tokens: 120_000,
+        output_tokens: 9_000,
+        cache_read_input_tokens: 400_000,
+        cache_creation_input_tokens: 30_000,
+        model: 'claude-sonnet-5-5',
+      },
+    })
+    await measured($, {
+      context: { tokens: 87_000, window: 128_000, percent: 68 },
+      cost: { usd: 0.83 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: 82 }],
+    })
 
-    const ui = await pane($)
-    await ui.press({ key: 'tab-all' })
-    expect((await ui.find({ text: /No other session/ }))?.text).toContain('No other session')
+    const ui = await pane($, 'metrics')
+    expect((await ui.find({ text: /120k/ }))?.text).toContain('120k')
+    expect((await ui.find({ text: /9\.0k/ }))?.text).toContain('9.0k')
+    expect((await ui.find({ text: /430k/ }))?.text).toContain('430k')
+    expect((await ui.find({ text: /0\.83/ }))?.text).toContain('0.83')
+    // The context window and the rate-limit window are the engine's figures.
+    expect((await ui.find({ text: /68%/ }))?.text).toContain('68%')
+    expect((await ui.find({ text: /87\.0k \/ 128k/ }))?.text).toContain('/ 128k')
+    expect((await ui.find({ text: /82%/ }))?.text).toContain('82%')
     await ui.unmount()
   })
 
-  test('drops a row left behind by a session that went quiet', async ($, on) => {
-    const stale: SessionRecord = {
-      id: 's-3',
-      dir: 'long-gone',
-      goal: 'abandoned work',
-      phase: 'building',
-      done: 0,
-      total: 0,
-      startedAt: 0,
-      updatedAt: 0,
-      isWorking: true,
-      isComplete: false,
+  test('the clock splits the run across the phases it saw', async ($, on) => {
+    const { clock } = world($, on)
+    await $.session.start({
+      cwd: '/home/sam/projects/demo',
+      surface: 'terminal',
+      isInteractive: true,
+    })
+    // `/spec` opens the goal in planning, and the clock starts on it there.
+    await $.turn.start({ text: '/spec watch the clock', turnId: 't1' })
+    await todo($, [{ content: 'edit', status: 'in_progress', activeForm: 'editing' }])
+    await clock.advance(10_000)
+    // A run of edits moves the phase to building, and banking as each lands
+    // credits planning with the ten seconds it actually held. One edit would
+    // not be enough: `/spec` seeded the window with planning.
+    for (const file_path of ['a.ts', 'b.ts', 'c.ts']) {
+      await $.tool.call({ tool: 'Edit', file_path, old_string: 'x', new_string: 'y' })
     }
-    const { clock } = world($, on, { 'session:s-3': stale })
-    await clock.advance(48 * 60 * 60 * 1000)
-    await $.turn.start({ text: '/spec here now', turnId: 't1' })
 
-    const ui = await pane($)
-    await ui.press({ key: 'tab-all' })
-    expect(await ui.find({ text: /abandoned work/ })).toBeUndefined()
+    const ui = await pane($, 'metrics')
+    const planning = await ui.find({ text: /planning/ })
+    expect(planning?.text).toContain('planning')
+    expect(planning?.text).toContain('10s')
+    // Building is where the work is now, so its row is up from the first
+    // second — before it has had time to earn any.
+    expect((await ui.find({ text: /building/ }))?.text).toContain('building')
+    await ui.unmount()
+  })
+
+  test('a failing check and a failed call both show in the health line', async ($, on) => {
+    const { toolFailures } = world($, on)
+    await $.turn.start({ text: '/spec run the checks', turnId: 't1' })
+    toolFailures.value = true
+    await $.tool.call({ tool: 'Bash', command: 'npm test' })
+    await $.tool.call({ tool: 'Edit', file_path: 'a.ts', old_string: 'x', new_string: 'y' })
+    toolFailures.value = false
+
+    const ui = await pane($, 'metrics')
+    expect((await ui.find({ text: /1 check, 1 failed/ }))?.text).toContain('1 failed')
+    expect((await ui.find({ text: /2 failed calls/ }))?.text).toContain('2 failed calls')
+    await ui.unmount()
+  })
+
+  test('a file edited over and over reads as churn', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec keep at it', turnId: 't1' })
+    for (let i = 0; i < 4; i += 1) {
+      await $.tool.call({ tool: 'Edit', file_path: 'src/loop.ts', old_string: 'x', new_string: 'y' })
+    }
+
+    const ui = await pane($, 'metrics')
+    expect((await ui.find({ text: /loop\.ts ×4/ }))?.text).toContain('loop.ts ×4')
+    await ui.unmount()
+  })
+
+  test('clear forgets the figures as well as the goal', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec spend something', turnId: 't1' })
+    await $.turn.complete({
+      ...finished(),
+      usage: {
+        input_tokens: 120_000,
+        output_tokens: 9_000,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        model: 'claude-sonnet-5-5',
+      },
+    })
+
+    const before = await pane($, 'metrics')
+    expect((await before.find({ text: /120k/ }))?.text).toContain('120k')
+    await before.unmount()
+
+    await run($, 'clear')
+    const after = await pane($, 'metrics')
+    expect(await after.find({ text: /120k/ })).toBeUndefined()
+    expect((await after.find({ text: /Nothing measured yet/ }))?.text).toContain(
+      'Nothing measured yet',
+    )
+    await after.unmount()
+  })
+
+  test('a scrolled pane says which rows it is showing', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec scroll me', turnId: 't1' })
+    await todo($, [
+      { content: 'one', status: 'completed', activeForm: 'doing one' },
+      { content: 'two', status: 'pending', activeForm: 'doing two' },
+      { content: 'three', status: 'pending', activeForm: 'doing three' },
+    ])
+
+    const ui = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: 'terminal' as const,
+      component: 'Pane' as const,
+      props: { ...PANE_PROPS, scroll: { offset: 1, bodyRows: 2 } },
+      requestId: PANE,
+    })
+    await ui.press({ key: 'tab-goal' })
+    expect((await ui.find({ text: /↕ 2–3 of 3/ }))?.text).toContain('↕ 2–3 of 3')
     await ui.unmount()
   })
 })
@@ -489,34 +602,43 @@ describe('the command', () => {
 
     const opened = await run($, '')
     expect(opened.text).toContain('Plan Progress')
-    expect(opened.text).toContain('is open')
+    expect(opened.text).toContain('metrics are open')
 
     const ui = await pane($)
     expect((await ui.find({ text: /something to show/ }))?.text).toContain('something to show')
     await ui.unmount()
   })
 
-  test('all switches the view, and the pane comes up on the list', async ($, on) => {
+  test('a bare command opens the metrics, and goal switches to the checklist', async ($, on) => {
     world($, on)
     await $.turn.start({ text: '/spec something to show', turnId: 't1' })
-    expect((await run($, 'all')).text).toContain(
-      'All tasks',
-    )
+    await todo($, [{ content: 'a step', status: 'pending', activeForm: 'doing a step' }])
 
-    const ui = await pane($)
-    expect((await ui.find({ text: /No other session/ }))?.text).toContain('No other session')
-    await ui.unmount()
+    // No argument: the numbers, which is what the panel is for now.
+    expect((await run($, '')).text).toContain('metrics are open')
+    const metrics = await pane($, 'metrics')
+    expect((await metrics.find({ text: /Tokens/ }))?.text).toContain('Tokens')
+    await metrics.unmount()
+
+    // `goal` puts the checklist up instead.
+    expect((await run($, 'goal')).text).toContain('checklist is open')
+    const checklist = await pane($, 'goal')
+    expect((await checklist.find({ text: /a step/ }))?.text).toContain('a step')
+    await checklist.unmount()
   })
 
   test('says so when there is nothing to show yet', async ($, on) => {
     world($, on)
-    const opened = await run($, '')
-    expect(opened.text).toContain('no goal is running')
+    // The metrics open regardless — there are figures even with no goal — and
+    // say what they are waiting for.
+    expect((await run($, '')).text).toContain('metrics are open')
+    // The checklist has nothing to draw, and says so plainly.
+    expect((await run($, 'goal')).text).toContain('no goal is running')
   })
 
   test('says so when the terminal is too narrow for a pane', async ($, on) => {
     // A surface that cannot place the pane, so `$.ui.open` comes back refused.
-    world($, on, {}, false)
+    world($, on, false)
     await $.turn.start({ text: '/spec too narrow', turnId: 't1' })
     const opened = await run($, '')
     expect(opened.text).toContain('widen the terminal')
@@ -597,6 +719,45 @@ describe('the command', () => {
     expect((await ui.find({ text: /No goal is running/ }))?.text).toContain('No goal')
     await ui.unmount()
   })
+
+  test('a step shows how long it took', async ($, on) => {
+    const { clock } = world($, on)
+    await $.turn.start({ text: '/spec time each step', turnId: 't1' })
+    await todo($, [
+      { content: 'the first step', status: 'in_progress', activeForm: 'doing the first step' },
+      { content: 'the second step', status: 'pending', activeForm: 'doing the second' },
+    ])
+    await clock.advance(12_000)
+    // A tool call banks the seconds against the step that is in progress.
+    await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+
+    const ui = await pane($, 'goal')
+    // `find` answers with the text of the whole tree, so the assertion is on
+    // what follows each step: the one worked on carries a time, the other none.
+    const drawn = (await ui.find({ text: /the first step/ }))?.text ?? ''
+    expect(drawn).toContain('the first step')
+    expect(drawn).toMatch(/the first step\s+12s/)
+    expect(drawn).not.toMatch(/the second step\s+\d/)
+    await ui.unmount()
+  })
+
+  test('copy says so when the surface has no clipboard', async ($, on) => {
+    const { copyFails } = world($, on)
+    await $.turn.start({ text: '/spec nothing to copy into', turnId: 't1' })
+    copyFails.value = true
+    expect((await run($, 'copy')).text).toContain('nothing to copy into')
+  })
+
+  test('copy puts a summary on the clipboard', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec say what happened', turnId: 't1' })
+    await measured($, {
+      context: { tokens: 87_000, window: 128_000, percent: 68 },
+      cost: { usd: 0.83 },
+    })
+    const result = await run($, 'copy')
+    expect(result.text).toContain('clipboard')
+  })
 })
 
 describe('the band above the prompt', () => {
@@ -624,6 +785,32 @@ describe('the band above the prompt', () => {
 
     const ui = await band($, { hasSurvey: true }, 'band-survey')
     expect(JSON.stringify(await ui.drawn())).not.toContain('quiet now')
+    await ui.unmount()
+  })
+
+  test('the hidden row carries the figures, until band off takes them away', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec out of sight', turnId: 't1' })
+    await todo($, [{ content: 'a', status: 'in_progress', activeForm: 'doing a' }])
+    await measured($, {
+      context: { tokens: 87_000, window: 128_000, percent: 68 },
+      cost: { usd: 0.83 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: 82 }],
+    })
+    await run($, 'hide')
+
+    // With the panel gone the figures come to the row, where they still show.
+    let ui = await band($, {}, 'band-hidden')
+    expect((await ui.find({ text: /ctx/ }))?.text).toContain('68')
+    expect((await ui.find({ text: /↑/ }))?.text).toContain('$0.83')
+    expect((await ui.find({ text: /5h/ }))?.text).toContain('82')
+    await ui.unmount()
+
+    // `band off` leaves the row the goal alone, as it was.
+    expect((await run($, 'band off')).text).toContain('goal alone')
+    ui = await band($, {}, 'band-hidden-plain')
+    expect(await ui.find({ text: /ctx/ })).toBeUndefined()
+    expect((await ui.find({ key: 'panel' }))?.type).toBe('Button')
     await ui.unmount()
   })
 })

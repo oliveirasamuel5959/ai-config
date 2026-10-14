@@ -13,14 +13,6 @@ export const PHASES: readonly Phase[] = [
   'auditing',
 ]
 
-export const PHASE_LABEL: Record<Phase, string> = {
-  researching: 'researching',
-  planning: 'planning',
-  building: 'building',
-  testing: 'testing',
-  auditing: 'auditing',
-}
-
 /** Theme keys, so the panel follows the person's own theme. */
 export const PHASE_COLOR: Record<Phase, string> = {
   researching: 'suggestion',
@@ -95,7 +87,7 @@ const PLAN_TOOLS = new Set([
 ])
 
 /** A command that runs a check rather than changes something. */
-const CHECK_COMMAND =
+export const CHECK_COMMAND =
   /\b(pytest|vitest|jest|mocha|rspec|go\s+test|cargo\s+test|npm\s+(run\s+)?test|pnpm\s+test|yarn\s+test|make\s+test|typecheck|type-check|tsc\b|lint|eslint|ruff|flake8|mypy|pyright|gradle\s+test|mvn\s+test)\b/
 
 /** The phase a tool call points at, or undefined when it points at none. */
@@ -260,13 +252,78 @@ export function fractionOf(percent: number): number {
   return Math.min(1, Math.max(0, percent / 100))
 }
 
-/** Cuts text to `limit` characters, counting a surrogate pair as one. */
+/**
+ * Cells a string takes on screen. This is what any column arithmetic has to
+ * count: a wide glyph (CJK, fullwidth, most emoji) takes two cells, a combining
+ * mark none. Everything else takes one — including the box, bar and status
+ * glyphs this mod draws itself, which terminals render narrow.
+ */
+export function displayWidth(text: string): number {
+  let cells = 0
+  for (const char of text) cells += widthOf(char)
+  return cells
+}
+
+/** The cells one glyph takes: 0, 1 or 2. */
+function widthOf(char: string): number {
+  const code = char.codePointAt(0) ?? 0
+  // Combining marks and the zero-width formatting characters add nothing.
+  if ((code >= 0x300 && code <= 0x36f) || code === 0xfeff) return 0
+  if (code >= 0x200b && code <= 0x200f) return 0
+  const isWide =
+    (code >= 0x1100 && code <= 0x115f) || // Hangul Jamo
+    (code >= 0x2e80 && code <= 0x303e) || // CJK radicals, Kangxi, ideographic space
+    (code >= 0x3041 && code <= 0x33ff) || // kana, CJK symbols and punctuation
+    (code >= 0x3400 && code <= 0x4dbf) || // CJK extension A
+    (code >= 0x4e00 && code <= 0x9fff) || // CJK unified ideographs
+    (code >= 0xa000 && code <= 0xa4cf) || // Yi
+    (code >= 0xac00 && code <= 0xd7a3) || // Hangul syllables
+    (code >= 0xf900 && code <= 0xfaff) || // CJK compatibility ideographs
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) || // fullwidth forms
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f1e6 && code <= 0x1f1ff) || // regional indicators
+    (code >= 0x1f300 && code <= 0x1f6ff) || // pictographs, transport, symbols
+    (code >= 0x1f900 && code <= 0x1f9ff) || // supplemental symbols
+    (code >= 0x1fa70 && code <= 0x1faff) || // extended-A symbols
+    (code >= 0x20000 && code <= 0x3fffd) // CJK extension B and beyond
+  return isWide ? 2 : 1
+}
+
+/**
+ * Cuts text to `limit` screen cells, counting a wide glyph as two — so what it
+ * returns lines up in a column, which counting code points does not.
+ */
 export function truncate(text: string, limit: number): string {
   const flat = text.replace(/\s+/g, ' ').trim()
   if (limit < 1) return ''
-  const chars = Array.from(flat)
-  if (chars.length <= limit) return flat
-  return `${chars.slice(0, Math.max(0, limit - 1)).join('')}…`
+  if (displayWidth(flat) <= limit) return flat
+  let taken = ''
+  let used = 0
+  // One cell is held back for the ellipsis.
+  for (const char of flat) {
+    const cells = widthOf(char)
+    if (used + cells > limit - 1) break
+    taken += char
+    used += cells
+  }
+  return `${taken}…`
+}
+
+/**
+ * What a scrolled list says about itself: the rows in view and the total.
+ * `null` at the top, where the window needs no explaining.
+ */
+export function scrollNote(
+  offset: number,
+  bodyRows: number,
+  total: number,
+): string | null {
+  if (offset <= 0 || total === 0) return null
+  const first = Math.min(offset + 1, total)
+  const last = Math.min(offset + Math.max(1, bodyRows), total)
+  return `↕ ${first}–${last} of ${total}`
 }
 
 /** A short duration: `42s`, `12m 04s`, `1h 02m`. */
