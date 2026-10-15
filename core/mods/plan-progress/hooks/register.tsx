@@ -3,6 +3,15 @@ import type { EngineInterface, Register, RenderElement, RenderInput } from 'clau
 
 import type { Goal, Phase, TaskItem, ToolBucket, View } from '../types'
 import {
+  catalogFrom,
+  catalogRows,
+  countsOf,
+  emptyCatalog,
+  groupLabel,
+  nameWidth,
+  padTo,
+} from './catalog'
+import {
   accrueTime,
   addTurn,
   churn,
@@ -21,7 +30,6 @@ import {
   sparkline,
   summaryText,
   taskTime,
-  topNames,
 } from './metrics'
 import {
   PHASES,
@@ -63,6 +71,7 @@ const tasksAtom = atom({ plugin: 'plan-progress', key: 'tasks' } as const, [])
 const signalsAtom = atom({ plugin: 'plan-progress', key: 'signals' } as const, [])
 const metricsAtom = atom({ plugin: 'plan-progress', key: 'metrics' } as const, emptyMetrics())
 const viewAtom = atom({ plugin: 'plan-progress', key: 'view' } as const, 'metrics')
+const catalogAtom = atom({ plugin: 'plan-progress', key: 'catalog' } as const, emptyCatalog())
 const tickAtom = atom({ plugin: 'plan-progress', key: 'nowTick' } as const, 0)
 const hiddenAtom = atom({ plugin: 'plan-progress', key: 'isBandHidden' } as const, false)
 const wantedAtom = atom({ plugin: 'plan-progress', key: 'isPanelWanted' } as const, true)
@@ -179,6 +188,28 @@ async function attributeAgent($: $T, agent: string): Promise<void> {
     if (target === undefined) return tasks
     return tasks.map(task => (task.id === target.id ? { ...task, agent } : task))
   })
+}
+
+/**
+ * Reads the session's own listings — every skill and agent type it has, with
+ * where each came from — into the catalog the Skills & agents tab draws.
+ *
+ * `summary` is asked for and `full` never is: both answer the same listings,
+ * but `summary` estimates them locally while `full` sends a token-count request
+ * per file, and a panel that cost money to look at would be a poor trade for a
+ * table of names. The whole call is wrapped because the breakdown is absent
+ * without a bound session and the read may be refused; a panel that cannot say
+ * what is available should still draw everything else.
+ */
+async function readCatalog($: $T): Promise<void> {
+  try {
+    const usage = await $.session.usage({ breakdown: 'summary' })
+    const now = await $.clock.now()
+    await update($, catalogAtom, () => catalogFrom(usage.context.breakdown, now))
+  } catch {
+    // Left as it stands: an unread catalog says so, rather than claiming the
+    // session has nothing.
+  }
 }
 
 /** Starts a goal for a prompt, when the prompt is one. */
@@ -309,7 +340,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'plan-progress',
       description: 'Show the running goal: phase, steps, progress and elapsed',
-      argumentHint: '[metrics|goal|copy|band|hide|show|clear]',
+      argumentHint: '[metrics|goal|skills|copy|band|hide|show|clear]',
     })
 
     // The engine's own session figures, read once so the panel has the context
@@ -328,6 +359,10 @@ export const register: Register = (on, options) => {
         costUsd: usage.cost?.usd ?? m.costUsd,
       }))
     }
+
+    // What the session has to hand, read once here so the Skills & agents tab
+    // is filled the first time it is opened rather than costing a wait then.
+    await readCatalog($)
 
     // The panel is a monitor: it comes up with the session and stays docked
     // beside the transcript. Unasked it is placed only where the layout docks
@@ -593,8 +628,11 @@ export const register: Register = (on, options) => {
       }
     }
 
-    // No argument opens the numbers: that is what the panel is for now.
-    const view: View = arg === 'goal' ? 'goal' : 'metrics'
+    // No argument opens the numbers: that is what the panel is for now. The
+    // catalog is re-read on the way in, as its tab's own button does, so the
+    // listing is as current as the moment it was asked for.
+    const view: View = arg === 'goal' ? 'goal' : arg === 'skills' ? 'catalog' : 'metrics'
+    if (view === 'catalog') await readCatalog($)
     await update($, viewAtom, () => view)
     const opened = await placePanel($)
     if (!opened) {
@@ -607,7 +645,9 @@ export const register: Register = (on, options) => {
       text:
         view === 'goal'
           ? 'Plan Progress: the checklist is open.'
-          : 'Plan Progress: the metrics are open.',
+          : view === 'catalog'
+            ? 'Plan Progress: the skills and agents are open.'
+            : 'Plan Progress: the metrics are open.',
     }
   })
 
@@ -742,6 +782,24 @@ export const register: Register = (on, options) => {
         >
           <Text weight={view === 'goal' ? 'semibold' : 'regular'}>Goal</Text>
         </Button>
+        <Text dimColor> | </Text>
+        <Button
+          key="tab-catalog"
+          plain
+          hotkey="3"
+          onPress={() => {
+            // Opening the tab re-reads the listings, so a skill installed
+            // mid-session turns up without the panel polling every turn for a
+            // view that is usually closed.
+            void (async () => {
+              await readCatalog($)
+              await update($, viewAtom, () => 'catalog')
+              repaint($)
+            })()
+          }}
+        >
+          <Text weight={view === 'catalog' ? 'semibold' : 'regular'}>Skills &amp; agents</Text>
+        </Button>
         <Text dimColor>   </Text>
         <Button
           key="hide"
@@ -768,6 +826,7 @@ export const register: Register = (on, options) => {
       const metrics = await read($, metricsAtom)
       const tasks = await read($, tasksAtom)
       const goal = await read($, goalAtom)
+      const catalog = await read($, catalogAtom)
       const width = barWidth(columns)
       // Four figures across need room for two label/value columns and the gap.
       const isWide = columns >= 64
@@ -792,8 +851,6 @@ export const register: Register = (on, options) => {
         count: metrics.toolsByBucket[bucket] ?? 0,
       })).filter(entry => entry.count > 0)
 
-      const skills = topNames(metrics.skills)
-      const agents = topNames(metrics.agents)
       const churned = churn(metrics.editCounts)
       const troubles = [
         metrics.failedTools > 0
@@ -931,18 +988,40 @@ export const register: Register = (on, options) => {
                   </Text>
                 </Box>
               )}
-              {skills.length > 0 && (
-                <Box>
-                  <Text dimColor>{'  skills '}</Text>
-                  <Text>{skills.join(' · ')}</Text>
-                </Box>
-              )}
-              {agents.length > 0 && (
-                <Box>
-                  <Text dimColor>{'  agents '}</Text>
-                  <Text>{agents.join(' · ')}</Text>
-                </Box>
-              )}
+              {/* What ran, in the catalog's own grammar — scope, name, `×count`
+                  — so the two places read as one panel. Kept as two labelled
+                  blocks rather than one merged list, so a skill is never
+                  mistaken for an agent; the available-but-unused names stay on
+                  the Skills & agents tab, where listing them does not bury the
+                  figures this section exists to give. */}
+              {([
+                ['skills', catalogRows(catalog, 'skills', metrics.skills)],
+                ['agents', catalogRows(catalog, 'agents', metrics.agents)],
+              ] as const).map(([label, all]) => {
+                const ran = all.filter(entry => entry.used > 0)
+                if (ran.length === 0) return null
+                const nameCol = Math.min(24, Math.max(10, nameWidth(ran, columns - 30)))
+                return (
+                  <Box key={label} flexDirection="column">
+                    <Text dimColor>{`  ${label}`}</Text>
+                    {ran.map(entry => (
+                      <Box key={entry.name}>
+                        {/* The scope only when the session actually said it.
+                            A name read before the catalog was is not from
+                            `other` — the panel simply does not know, and
+                            saying `other` would be a claim it cannot back. */}
+                        {catalog.isRead ? (
+                          <Text dimColor>{`    ${groupLabel(entry.scope).padEnd(9)}`}</Text>
+                        ) : (
+                          <Text dimColor>{'    '}</Text>
+                        )}
+                        <Text>{padTo(truncate(entry.name, nameCol), nameCol)}</Text>
+                        <Text dimColor tabular>{` ×${entry.used}`}</Text>
+                      </Box>
+                    ))}
+                  </Box>
+                )
+              })}
               {churned.length > 0 && (
                 <Box>
                   <Text dimColor>{'  churn  '}</Text>
@@ -985,7 +1064,87 @@ export const register: Register = (on, options) => {
           )}
 
           <Text dimColor>
-            /plan-progress goal · copy · band · hide · show · clear
+            /plan-progress goal · skills · copy · band · hide · show · clear
+          </Text>
+        </Box>
+      )
+    }
+
+    if (view === 'catalog') {
+      const catalog = await read($, catalogAtom)
+      const metrics = await read($, metricsAtom)
+      const skills = catalogRows(catalog, 'skills', metrics.skills)
+      const agents = catalogRows(catalog, 'agents', metrics.agents)
+      const age = formatAge(Math.max(0, now - catalog.readAt))
+
+      // The counts reset with each goal (`restartMetrics`), while the listing
+      // is the session's — so `×N` reads as "used by this goal", which is the
+      // same span the rest of the metrics tab counts over.
+      const section = (
+        title: string,
+        rows: ReturnType<typeof catalogRows>,
+      ): RenderElement => {
+        const counts = countsOf(rows)
+        // Sized to the widest name so the counts line up down the group, and
+        // capped so one long name cannot push them off the pane.
+        const nameCol = Math.min(28, Math.max(12, nameWidth(rows, columns - 26)))
+        return (
+          <>
+            <Box>
+              <Text weight="semibold">{title.padEnd(8)}</Text>
+              <Text dimColor tabular>
+                {counts.available} available · {counts.used} used
+              </Text>
+            </Box>
+            {rows.map(row => (
+              <Box key={`${title}:${row.name}`}>
+                {/* The scope is named once per group, so the column does not
+                    repeat `project` down twenty rows. */}
+                <Text dimColor>{`  ${(row.isGroupStart ? groupLabel(row.scope) : '').padEnd(9)}`}</Text>
+                <Text>{padTo(truncate(row.name, nameCol), nameCol)}</Text>
+                {row.used > 0 && (
+                  <Text dimColor tabular>
+                    {` ×${row.used}`}
+                  </Text>
+                )}
+              </Box>
+            ))}
+          </>
+        )
+      }
+
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text dimColor>{'─'.repeat(Math.max(1, Math.min(columns, 60)))}</Text>
+
+          {!catalog.isRead ? (
+            <Text dimColor>
+              Nothing read yet — reopen this tab, or run /plan-progress skills.
+            </Text>
+          ) : skills.length === 0 && agents.length === 0 ? (
+            <Text dimColor>
+              The session lists no skills or agents for this context.
+            </Text>
+          ) : (
+            <>
+              {section('Skills', skills)}
+              <Text> </Text>
+              {section('Agents', agents)}
+              {/* When the listing was taken. The tab re-reads on every open,
+                  so this is normally seconds old; it is here for the case where
+                  it is not, since a stale listing that says nothing about itself
+                  is the one that misleads. `formatAge` reads `now` for anything
+                  under a minute, which needs no `ago` after it. */}
+              <Text dimColor>
+                {'  read '}
+                {age === 'now' ? age : `${age} ago`}
+              </Text>
+            </>
+          )}
+
+          <Text dimColor>
+            /plan-progress metrics · goal · copy · band · hide · show · clear
           </Text>
         </Box>
       )

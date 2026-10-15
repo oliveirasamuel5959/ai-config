@@ -42,6 +42,25 @@ export type ToolBucket =
 /** A file and how many times it was edited. */
 export type FileEdit = { path: string; count: number }
 
+/** Where a skill or an agent came from, in the panel's own short words. */
+export type Scope = 'project' | 'user' | 'plugin' | 'policy' | 'builtin' | 'mcp' | 'other'
+
+/** One thing the session has to hand, and where it came from. */
+export type CatalogEntry = { name: string; scope: Scope }
+
+/**
+ * What the session lists for the context — every skill and agent type it has,
+ * not only the ones seen at work. `isRead` tells "the engine listed nothing"
+ * apart from "nothing has been asked yet": the two draw the same empty table
+ * but do not mean the same thing.
+ */
+export type Catalog = {
+  skills: CatalogEntry[]
+  agents: CatalogEntry[]
+  readAt: number
+  isRead: boolean
+}
+
 /** A rate-limit window, as the engine reports it. */
 export type RateLimit = { kind: string; percentUsed: number; resetsAt?: string }
 
@@ -91,7 +110,7 @@ export type Metrics = {
   lastToolName: string | null
 }
 
-export type View = 'goal' | 'metrics'
+export type View = 'goal' | 'metrics' | 'catalog'
 
 declare module 'claude-code' {
   interface PluginState {
@@ -101,6 +120,8 @@ declare module 'claude-code' {
       signals: Phase[]
       metrics: Metrics
       view: View
+      /** The session's skills and agent types, and where each came from. */
+      catalog: Catalog
       /** Ticks once a second while a goal runs, so elapsed time redraws. */
       nowTick: number
       isBandHidden: boolean
