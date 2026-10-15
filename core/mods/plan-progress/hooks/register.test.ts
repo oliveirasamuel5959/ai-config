@@ -40,7 +40,39 @@ type TestOn = On
  * Every hook beneath the plugins is registered here, before the test's first
  * call on `$`: the kit asks for them once, when the plugins load.
  */
-function world($: Test$, on: TestOn, canPlace = true) {
+/**
+ * The listing most tests get: two skills and an agent, across two scopes. It
+ * is spelled as the engine's breakdown spells it — the skills nested under
+ * `skillFrontmatter`, the agents a flat list — because that shape is what the
+ * mod reads.
+ */
+const DEFAULT_LISTING = {
+  skills: {
+    skillFrontmatter: [
+      { name: 'spec-kit', source: 'projectSettings' },
+      { name: 'doc', source: 'userSettings' },
+    ],
+  },
+  agents: [{ agentType: 'planner', source: 'projectSettings' }],
+}
+
+/** A listing with neither skills nor agents, as a narrow session reports. */
+const NO_LISTING = { skills: { skillFrontmatter: [] }, agents: [] }
+
+type Listing = typeof DEFAULT_LISTING
+
+/**
+ * `hasListing` false stands for a session that never answered with a breakdown
+ * at all — the read was refused, or there is no session bound — which the
+ * panel must tell apart from a session that answered with nothing.
+ */
+function world(
+  $: Test$,
+  on: TestOn,
+  canPlace = true,
+  hasListing = true,
+  listing: Listing = DEFAULT_LISTING,
+) {
   const clock = mock.clock(on)
   const panes = new Set<string>()
   const answer = () =>
@@ -53,14 +85,26 @@ function world($: Test$, on: TestOn, canPlace = true) {
   on('session.start', () => ({ cwd: '/home/sam/projects/demo' }))
   // The engine pushes these after each main-thread turn.
   on('session.measure', () => ({ changed: [] }))
-  on('session.usage', () => ({
+  // The kit's hooks are `($, e, next)` like the plugin's own, so the args are
+  // the second parameter. Answered only when the call asked for a breakdown, as
+  // the engine answers it, so the plain figure read the other tests rely on is
+  // left exactly as it was.
+  on('session.usage', (_$, e) => ({
     value: {
       startedAt: 0,
-      context: { tokens: 0, window: 200_000, percent: 0 },
+      context: {
+        tokens: 0,
+        window: 200_000,
+        percent: 0,
+        ...(e.breakdown === undefined || !hasListing ? {} : { breakdown: listing }),
+      },
       rateLimits: [],
       cost: { usd: 0 },
     },
   }))
+  // A skill expanded for the model. The kit resolves `$.skill.prompt` only
+  // when something beneath the plugins answers it, as the engine does.
+  on('skill.prompt', () => ({ text: 'the skill body' }))
   on('turn.start', () => ({ turnId: 't1' }))
   on('turn.complete', () => ({ text: 'ok' }))
   // Flipped by a test that wants a tool call to come back failed, which is how
@@ -127,13 +171,54 @@ function finished(turnId = 't1') {
   return { turnId, reason: 'answer' as const, answer: 'done', durationMs: 1000, isAborted: false }
 }
 
+/**
+ * A skill used, as the engine reports one: `skill.prompt` fires whenever it
+ * expands a skill's prompt (`/name`, the Skill tool, a preload), and that is
+ * the event the mod counts on. A bare `tool.call` of `Skill` does not fire it,
+ * so a test that wants a count raised goes through here.
+ */
+function used($: Test$, skill: string) {
+  return $.skill.prompt({ skill, text: 'the skill body' })
+}
+
+/**
+ * The drawn tree's rows, each row's own texts joined — a Box and the Texts in
+ * it are how a row is drawn, so a row only reads as the person sees it once
+ * they are put back together. Only a Box with no Box inside it counts as a row,
+ * which is what keeps a container from repeating its children.
+ */
+async function rows(ui: { drawn: () => Promise<unknown> }): Promise<string[]> {
+  const found: string[] = []
+  const walk = (node: unknown): string => {
+    if (Array.isArray(node)) return node.map(walk).join('')
+    if (node === null || typeof node !== 'object') return typeof node === 'string' ? node : ''
+    const el = node as { type?: string; children?: unknown[] }
+    const children = el.children ?? []
+    if (el.type === 'Box' && !children.some(child => isBox(child))) {
+      const text = children.map(walk).join('')
+      if (text.trim().length > 0) found.push(text)
+      return text
+    }
+    return children.map(walk).join('')
+  }
+  walk(await ui.drawn())
+  return found
+}
+
+function isBox(node: unknown): boolean {
+  return (
+    node !== null &&
+    typeof node === 'object' &&
+    (node as { type?: string }).type === 'Box'
+  )
+}
+
 /** Runs the mod's own slash command, as the person typing it would. */
 function run($: Test$, args: string) {
   return $.command.run({
     command: 'plan-progress',
     args,
-    origin: { kind: 'composer' },
-    presentation: { isFullscreen: true, columns: 120 },
+    origin: { kind: 'composer' },    presentation: { isFullscreen: true, columns: 120 },
   })
 }
 
@@ -141,7 +226,7 @@ function run($: Test$, args: string) {
  * The pane, showing the tab asked for. It opens on the metrics — the numbers
  * are what the panel is for now — so the checklist is one press away.
  */
-async function pane($: Test$, tab: 'goal' | 'metrics' = 'goal') {
+async function pane($: Test$, tab: 'goal' | 'metrics' | 'catalog' = 'goal') {
   const ui = await $.ui.mount({
     plugin: PLUGIN,
     surface: 'terminal' as const,
@@ -150,6 +235,7 @@ async function pane($: Test$, tab: 'goal' | 'metrics' = 'goal') {
     requestId: PANE,
   })
   if (tab === 'goal') await ui.press({ key: 'tab-goal' })
+  if (tab === 'catalog') await ui.press({ key: 'tab-catalog' })
   return ui
 }
 
@@ -457,6 +543,127 @@ describe('the skill and the agent at work', () => {
     expect((await ui.find({ text: /◇Explore/ }))?.text).toContain('◇Explore')
     expect((await ui.find({ text: /agent Explore/ }))?.text).toContain('agent Explore')
     await ui.unmount()
+  })
+})
+
+describe('the skills and agents the session has', () => {
+  test('the tab lists what is available, grouped by where it came from', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec see the catalog', turnId: 't1' })
+
+    const ui = await pane($, 'catalog')
+    // Everything the session has, not only what ran: `doc` and `planner` were
+    // never named by a tool call, and are still listed.
+    expect((await ui.find({ text: /spec-kit/ }))?.text).toContain('spec-kit')
+    expect((await ui.find({ text: /doc/ }))?.text).toContain('doc')
+    expect((await ui.find({ text: /planner/ }))?.text).toContain('planner')
+    // With the scope each came from, which is the whole point of the view.
+    expect((await ui.find({ text: /project/ }))?.text).toContain('project')
+    expect((await ui.find({ text: /user/ }))?.text).toContain('user')
+    await ui.unmount()
+  })
+
+  test('a used one carries its count, and an unused one carries none', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec count them', turnId: 't1' })
+    await used($, 'spec-kit')
+    await used($, 'spec-kit')
+
+    const ui = await pane($, 'catalog')
+    // A row is a Box of Texts, so it only reads whole once they are joined.
+    const drawn = await rows(ui)
+    expect(drawn.some(row => row.includes('spec-kit') && row.includes('×2'))).toBe(true)
+    // `doc` is available and never ran, so its row carries no count.
+    const doc = drawn.find(row => row.includes('doc'))
+    expect(doc).toBeDefined()
+    expect(doc).not.toContain('×')
+    await ui.unmount()
+  })
+
+  test('the header says how many there are and how many ran', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec the header', turnId: 't1' })
+
+    const ui = await pane($, 'catalog')
+    expect((await ui.find({ text: /2 available · 0 used/ }))?.text).toContain('2 available')
+    expect((await ui.find({ text: /1 available · 0 used/ }))?.text).toContain('1 available')
+    await ui.unmount()
+  })
+
+  test('the command opens it, and re-reads on the way in', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec by command', turnId: 't1' })
+
+    const reply = await run($, 'skills')
+    expect(reply.text).toContain('skills and agents are open')
+
+    const ui = await pane($, 'catalog')
+    expect((await ui.find({ text: /spec-kit/ }))?.text).toContain('spec-kit')
+    await ui.unmount()
+  })
+
+  test('it says so deliberately when nothing has been read yet', async ($, on) => {
+    world($, on, true, false)
+    await $.turn.start({ text: '/spec no listing', turnId: 't1' })
+
+    const ui = await pane($, 'catalog')
+    expect((await ui.find({ text: /Nothing read yet/ }))?.text).toContain('Nothing read yet')
+    await ui.unmount()
+  })
+
+  test('it says the session lists nothing when the listing is empty', async ($, on) => {
+    world($, on, true, true, NO_LISTING)
+    await $.turn.start({ text: '/spec empty listing', turnId: 't1' })
+
+    const ui = await pane($, 'catalog')
+    expect((await ui.find({ text: /lists no skills or agents/ }))?.text).toContain(
+      'lists no skills or agents',
+    )
+    await ui.unmount()
+  })
+
+  test('the metrics tab names what ran, in the catalog grammar', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec one ran', turnId: 't1' })
+    await used($, 'spec-kit')
+    const ui = await pane($, 'metrics')
+    const drawn = await rows(ui)
+    expect(drawn.some(row => row.includes('spec-kit') && row.includes('×1'))).toBe(true)
+    await ui.unmount()
+  })
+
+  test('what ran is drawn a row each, aligned under its scope', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec two ran', turnId: 't1' })
+    await used($, 'spec-kit')
+    await used($, 'doc')
+
+    // Opening the catalog tab is what reads the listing, and it is the reading
+    // that tells each name its scope; the metrics tab draws the same rows.
+    const ui = await pane($, 'catalog')
+    await ui.press({ key: 'tab-metrics' })
+    const drawn = await rows(ui)
+    expect(drawn.some(row => row.includes('project') && row.includes('spec-kit'))).toBe(true)
+    expect(drawn.some(row => row.includes('user') && row.includes('doc'))).toBe(true)
+    await ui.unmount()
+  })
+
+  test('an available name that never ran stays off the metrics tab', async ($, on) => {
+    world($, on)
+    await $.turn.start({ text: '/spec one of two ran', turnId: 't1' })
+    await used($, 'spec-kit')
+
+    const metricsTab = await pane($, 'metrics')
+    const drawn = await rows(metricsTab)
+    expect(drawn.some(row => row.includes('spec-kit'))).toBe(true)
+    // `doc` is available, and the metrics tab is about what ran.
+    expect(drawn.some(row => row.includes('doc'))).toBe(false)
+    await metricsTab.unmount()
+
+    // The catalog tab is where the whole listing lives, unused ones included.
+    const catalogTab = await pane($, 'catalog')
+    expect((await rows(catalogTab)).some(row => row.includes('doc'))).toBe(true)
+    await catalogTab.unmount()
   })
 })
 
