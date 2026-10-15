@@ -61,9 +61,11 @@ Authoring rules:
 - `hooks/hooks.json` lists the module; `hooks/register.tsx` holds `export const register: Register`.
   `hooks/progress.ts` is the other half — the pure part, turning observations into a phase, a
   checklist and a bar, with no `$` in sight. `hooks/metrics.ts` is a second pure module holding the
-  accounting: what a turn cost, where the time went, what went wrong. `hooks/register.test.ts` covers
-  register with a mocked engine; `hooks/progress.test.ts` and `hooks/metrics.test.ts` cover the pure
-  two directly.
+  accounting: what a turn cost, where the time went, what went wrong. `hooks/catalog.ts` is a third:
+  what the session has to hand — every skill and agent type the engine lists, the scope each came
+  from, and how the two are laid out in columns. `hooks/register.test.ts` covers register with a
+  mocked engine; `hooks/progress.test.ts`, `hooks/metrics.test.ts` and `hooks/catalog.test.ts` cover
+  the pure three directly.
 - Every value the mod keeps in `$.state` is declared in `types/index.d.ts`, which the module imports
   its value types from. Keep it hand-written; it is the contract, not a build artifact.
 - `.claude-plugin/types/` is a *different* directory and is **engine-written** — the API
@@ -93,6 +95,31 @@ per-tool variants stay invisible to Claude while `sync.sh` reads them for OpenCo
 - Prefer skills over commands for new work: Claude Code has folded commands into skills.
 - Commits are **Conventional Commits**, scoped to what moved: `core`, `software-dev`,
   `data-science`, or no scope for a repo-wide change.
+
+## Inventory the agents and skills before you implement
+
+This file is also the global instruction text for both tools, so the rule below is a working
+convention, not a note about this repo.
+
+Before starting any non-trivial task — a feature, a refactor, a review, an analysis — look at what
+is already installed at **both** scopes, and use it:
+
+- **Project scope**, beside the code: `<project>/.claude/agents/`, `<project>/.claude/skills/`,
+  `<project>/.opencode/agents/`.
+- **User scope**, on this machine: `~/.claude/agents/`, `~/.claude/skills/`,
+  `~/.config/opencode/agents/`, and `~/.agents/skills/` — the skill root both tools read, which
+  `sync.sh` installs into.
+
+A project may narrow or override what the user scope provides, so check both rather than stopping
+at the first one that exists. `claude` lists what it has loaded, and `/skills` lists the
+available skills.
+
+Then act on it: when a subagent matches the work, delegate to it instead of doing the work
+inline — that is what it is there for, and it keeps the main thread's context free. When a skill
+matches, invoke it rather than re-deriving its procedure from scratch.
+
+This is about what is **already installed**. Finding and installing *new* skills from the wider
+ecosystem is the separate `find-skills` skill's job.
 
 ## Verification
 
